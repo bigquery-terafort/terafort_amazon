@@ -110,8 +110,20 @@ class Token:
                 time.sleep(5 * attempt)
                 continue
             if r.status_code != 200:
-                fail(f"LWA token HTTP {r.status_code}: {r.text[:300]} "
-                     f"(check client id/secret + security profile mapping)")
+                # Surface the EXACT LWA error (error + error_description) --
+                # 'invalid_scope'  => profile not ATTACHED to the Reporting API
+                # 'invalid_client' => wrong/miscopied client id or secret
+                try:
+                    e = r.json()
+                    detail = (f"error={e.get('error')!r} "
+                              f"description={e.get('error_description')!r}")
+                except ValueError:
+                    detail = r.text[:500]
+                fail(f"LWA token HTTP {r.status_code}: {detail}\n"
+                     f"   invalid_scope  -> My Settings > API Access > "
+                     f"Reporting API > profile ATTACH karo (Step 4)\n"
+                     f"   invalid_client -> Client ID/Secret dobara copy karo "
+                     f"(no spaces/newlines)")
             data = r.json()
             self._value = data["access_token"]
             self._expires_at = time.time() + int(data.get("expires_in", 3600))
