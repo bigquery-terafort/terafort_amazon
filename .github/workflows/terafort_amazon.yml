@@ -1,36 +1,46 @@
 # =============================================================================
-# Terafort <- Amazon Appstore Reporting API -> BigQuery          (v1.0)
+# Terafort <- Amazon Appstore Reporting API -> BigQuery          (v2.0)
 # Path MUST be: .github/workflows/terafort_amazon.yml
 #
-# AUTH DESIGN — PERMANENT (Apero se seekha hua sabaq):
-#   LWA client_credentials (CLIENT_ID + SECRET -> fresh 1h token every run).
-#   NO refresh-token chain, NO persist step, NO GH_PAT, NO canary, NO manual
-#   re-seed — EVER. Credentials live until the security profile is deleted.
-#   (Amazon recommends refreshing the security profile every ~6 months —
-#    set a calendar reminder; that is the ONLY maintenance.)
+# v1.0 SE KYA BADLA:
+#   1. 🔴 KEEPALIVE JOB  — GitHub 60 din tak repo par koi commit na ho to
+#      scheduled workflow CHUP-CHAAP band kar deta hai. Koi alert nahi aata.
+#      Hamare paas ye pehle ho chuka hai (AdMob-4 par 2 din ka data gum).
+#      Ab keepalive rozana chalta hai — workflow kabhi band nahi hoga.
+#   2. permissions: contents: write  (keepalive ke commit ke liye)
+#   3. requirements.txt na ho to bhi chalega (fallback pip install)
+#   4. Behtar health check — sirf row count nahi, GUM MAHINE bhi batata hai
+#   5. Backfill timeout 120 → 180 min (2018 se poori history ke liye)
 #
-# Reports pulled (everything the API offers):
-#   sales / earnings / subscription / subscriptions_overview
-#   -> BigQuery dataset amazon_appstore:
-#      sales_raw / earnings_raw / subscription_raw / subs_overview_raw
+# AUTH — PERMANENT:
+#   LWA client_credentials (CLIENT_ID + SECRET -> har run par fresh 1h token)
+#   NO refresh-token chain, NO persist step, NO GH_PAT, NO manual re-seed.
+#   ⚠️ Amazon har ~6 mahine security profile refresh karne ka kehta hai —
+#      calendar reminder laga lein. Bas yehi ek maintenance hai.
 #
-# Idempotent: each monthly file DELETE+load by report_month — safe to re-run.
-# Restatement-safe: daily mode re-pulls current + previous month (Amazon
-# updates monthly files every 24h, lag up to 48h, adjustments land in the
-# month they are made).
+#   ⚠️ Security profile "My Settings ⌄ → API Access → Reporting API" par
+#      ATTACH honi chahiye. Warna invalid_scope aayega.
 #
-# FIRST RUN: manual dispatch with mode=backfill (backfill_start=2018-01)
-#            to pull the full history. After that the crons keep it fresh.
+# Reports:
+#   sales · earnings (monthly) · earnings (YEARLY 🆕) ·
+#   subscription · subscriptions_overview
+#   -> BigQuery amazon_appstore:
+#      sales_raw · earnings_raw · earnings_yearly_raw ·
+#      subscription_raw · subs_overview_raw
 #
-# Required repo secrets: AMAZON_CLIENT_ID, AMAZON_CLIENT_SECRET,
-#                        GCP_SA_KEY, BQ_PROJECT
+# Idempotent + atomic: har period temp table se TRANSACTION mein swap hota
+# hai — beech mein fail ho to purana data salamat.
+#
+# FIRST RUN: manual dispatch, mode=backfill, backfill_start=2018-01
+#
+# Secrets: AMAZON_CLIENT_ID · AMAZON_CLIENT_SECRET · GCP_SA_KEY · BQ_PROJECT
 # =============================================================================
 name: terafort_amazon_to_bigquery
 
 on:
   schedule:
-    - cron: "45 2 * * *"        # 02:45 UTC = 07:45 PKT daily
-    - cron: "45 14 * * *"       # 14:45 UTC = 19:45 PKT daily (safety run)
+    - cron: "45 2 * * *"        # 02:45 UTC = 07:45 PKT  (staging 04:00 UTC se pehle ✅)
+    - cron: "45 14 * * *"       # 14:45 UTC = 19:45 PKT  (safety run)
   workflow_dispatch:
     inputs:
       mode:
@@ -46,7 +56,7 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write               # 🔧 keepalive ke commit ke liye (v1.0 mein 'read' tha)
 
 concurrency:
   group: amazon-pull            # backfill + cron kabhi ek saath na chalein
@@ -55,7 +65,7 @@ concurrency:
 jobs:
   pull-and-load:
     runs-on: ubuntu-latest
-    timeout-minutes: 120        # full 2018+ backfill needs headroom
+    timeout-minutes: 180        # 2018+ backfill ke liye headroom
 
     steps:
       - name: Checkout
@@ -67,8 +77,16 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      # 🔧 requirements.txt na ho to bhi na tootay
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            echo "requirements.txt nahi mili — seedha install kar rahe hain"
+            pip install requests google-cloud-bigquery
+          fi
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -77,32 +95,82 @@ jobs:
 
       - name: Run Amazon Appstore -> BigQuery pipeline
         env:
-          AMAZON_CLIENT_ID: ${{ secrets.AMAZON_CLIENT_ID }}
+          AMAZON_CLIENT_ID:     ${{ secrets.AMAZON_CLIENT_ID }}
           AMAZON_CLIENT_SECRET: ${{ secrets.AMAZON_CLIENT_SECRET }}
-          BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
-          BQ_DATASET: amazon_appstore
-          MODE: ${{ inputs.mode || 'daily' }}
-          BACKFILL_START: ${{ inputs.backfill_start || '2018-01' }}
+          BQ_PROJECT:           ${{ secrets.BQ_PROJECT }}
+          BQ_DATASET:           amazon_appstore
+          MODE:                 ${{ inputs.mode || 'daily' }}
+          BACKFILL_START:       ${{ inputs.backfill_start || '2018-01' }}
         run: python terafort_amazon.py
 
-      - name: Verify load (rows per table per month, latest 6)
+      # 🔧 Behtar health check — GUM MAHINE bhi batata hai
+      - name: Health check
+        if: always()
         env:
           BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
         run: |
           python - <<'EOF'
           import os
           from google.cloud import bigquery
+          from datetime import date
+
           bq = bigquery.Client(project=os.environ["BQ_PROJECT"])
-          for t in ["sales_raw", "earnings_raw",
+          ds = f'{os.environ["BQ_PROJECT"]}.amazon_appstore'
+
+          for t in ["sales_raw", "earnings_raw", "earnings_yearly_raw",
                     "subscription_raw", "subs_overview_raw"]:
+              print(f"\n── {t} " + "─" * 34)
               try:
-                  q = f"""SELECT report_month, COUNT(*) rows
-                          FROM `{os.environ["BQ_PROJECT"]}.amazon_appstore.{t}`
+                  q = f"""SELECT report_month, COUNT(*) rows,
+                                 CAST(MAX(_loaded_at) AS STRING) last_load
+                          FROM `{ds}.{t}`
                           GROUP BY report_month
                           ORDER BY report_month DESC LIMIT 6"""
-                  print(f"── {t} " + "─" * 30)
-                  for r in bq.query(q).result():
-                      print(f"   {r.report_month}  {r.rows:>9,} rows")
+                  rows = list(bq.query(q).result())
+                  if not rows:
+                      print("   (table khaali)")
+                  for r in rows:
+                      print(f"   {r.report_month}  {r.rows:>9,} rows   "
+                            f"(load: {r.last_load[:19]})")
               except Exception as e:
-                  print(f"── {t}: (no table yet / {type(e).__name__})")
+                  print(f"   (table abhi nahi bani / {type(e).__name__})")
+
+          # 🔑 GUM MAHINE — sales_raw mein chhed to nahi?
+          print("\n── gum mahine check " + "─" * 26)
+          try:
+              q = f"""
+              WITH have AS (
+                SELECT DISTINCT report_month FROM `{ds}.sales_raw`),
+              want AS (
+                SELECT FORMAT_DATE('%Y-%m', d) AS report_month
+                FROM UNNEST(GENERATE_DATE_ARRAY(
+                  (SELECT MIN(PARSE_DATE('%Y-%m', report_month)) FROM have),
+                  CURRENT_DATE(), INTERVAL 1 MONTH)) d)
+              SELECT w.report_month FROM want w
+              LEFT JOIN have h USING (report_month)
+              WHERE h.report_month IS NULL ORDER BY 1"""
+              miss = [r.report_month for r in bq.query(q).result()]
+              if miss:
+                  print(f"   🔴 {len(miss)} mahine GUM: {', '.join(miss)}")
+                  print("      → backfill chalayein un mahinon ke liye")
+              else:
+                  print("   ✅ koi mahina gum nahi")
+          except Exception as e:
+              print(f"   (check nahi chal saka / {type(e).__name__})")
           EOF
+
+  # ═══════════════════════════════════════════════════════════════════════
+  #  🔴 KEEPALIVE — 60-din wala auto-disable rokta hai
+  #     GitHub: repo par 60 din se koi commit nahi → scheduled workflow
+  #     chup-chaap band. Ye job har run par ek chhota commit karta hai.
+  # ═══════════════════════════════════════════════════════════════════════
+  keepalive:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: gautamkrishnar/keepalive-workflow@v2
+        with:
+          use_api: true
+          time_elapsed: 45        # har 45 din baad commit (60 se pehle)
