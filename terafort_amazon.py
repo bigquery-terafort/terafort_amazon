@@ -360,14 +360,22 @@ def load_period(bq: bigquery.Client, dataset: str, table: str,
                 tgt  = bq.get_table(target)
                 have = {f.name for f in tgt.schema}
 
-            # ── 3b. FIX 2 — atomic swap ──
+            # ── 3b. FIX 2 + 8 — atomic swap, TARGET KE TYPE PAR CAST ──
+            #    🔧 FIX 8: purani tables (v1.0) mein _loaded_at STRING hai,
+            #    nayi script TIMESTAMP bhejti hai → 400 error. Ab har column
+            #    TARGET ke declared type par CAST hota hai, is liye chahe
+            #    target purana ho ya naya — kabhi type mismatch nahi hoga.
+            tgt_types   = {f.name: f.field_type for f in tgt.schema}
             insert_cols = [c for c in (cols + meta) if c in have]
             col_list    = ", ".join(f"`{c}`" for c in insert_cols)
+            sel_list    = ", ".join(
+                f"CAST(`{c}` AS {tgt_types.get(c, 'STRING')}) AS `{c}`"
+                for c in insert_cols)
             bq.query(f"""
                 BEGIN TRANSACTION;
                   DELETE FROM `{target}` WHERE report_month = '{period_key}';
                   INSERT INTO `{target}` ({col_list})
-                  SELECT {col_list} FROM `{tmp}`;
+                  SELECT {sel_list} FROM `{tmp}`;
                 COMMIT TRANSACTION;
             """).result()
     finally:
