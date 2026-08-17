@@ -166,11 +166,36 @@ jobs:
   # ═══════════════════════════════════════════════════════════════════════
   keepalive:
     runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'    # manual run par shor na machaye
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: gautamkrishnar/keepalive-workflow@v2
         with:
-          use_api: true
-          time_elapsed: 45        # har 45 din baad commit (60 se pehle)
+          fetch-depth: 0                   # git log ke liye poori history
+
+      # 🔧 APNA KEEPALIVE — koi third-party action nahi.
+      #    (org ne bahar ki actions block ki hui hain, aur ye zyada
+      #     mehfooz bhi hai — supply-chain ka khatra nahi.)
+      #    Sirf tab commit karta hai jab 45 din se koi commit na ho.
+      - name: Keepalive commit
+        run: |
+          set -euo pipefail
+          LAST=$(git log -1 --format=%ct)
+          NOW=$(date +%s)
+          DAYS=$(( (NOW - LAST) / 86400 ))
+          echo "ℹ️  aakhri commit ko $DAYS din huye"
+
+          if [ "$DAYS" -lt 45 ]; then
+            echo "✅ 45 din se kam — commit ki zaroorat nahi"
+            exit 0
+          fi
+
+          echo "⚠️  $DAYS din ho gaye — 60-din wale auto-disable se bachne ke liye commit kar rahe hain"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .keepalive
+          git add .keepalive
+          git commit -m "chore(keepalive): workflow ko zinda rakhne ke liye [skip ci]"
+          git push
+          echo "✅ keepalive commit ho gaya"
