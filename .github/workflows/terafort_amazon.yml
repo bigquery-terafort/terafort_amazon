@@ -96,6 +96,7 @@ jobs:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - name: Run Amazon Appstore -> BigQuery pipeline
+        if: steps.before.outputs.skip != 'true'
         env:
           AMAZON_CLIENT_ID:     ${{ secrets.AMAZON_CLIENT_ID }}
           AMAZON_CLIENT_SECRET: ${{ secrets.AMAZON_CLIENT_SECRET }}
@@ -168,7 +169,7 @@ jobs:
       # 🔁 RETRY — neeche wala main step 3 baar koshish karta hai.
       #    (nick-fields/retry se: platform API 5xx / timeout par khud dobara)
       - name: Health check
-        if: steps.before.outputs.skip != 'true' && (always())
+        if: always()
         env:
           BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
         run: |
